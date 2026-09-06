@@ -130,18 +130,20 @@ jobs:
           EXPORT_SUB_IDS: ${{ inputs.sub_ids }}
         run: |
           case "${{ inputs.export_type }}" in
-            "HTML")
-              EXPORT_FLAG=""
-              ;;
-            "PDF")
-              EXPORT_FLAG="--pdf"
-              ;;
-            "Markdown")
-              EXPORT_FLAG="--md"
-              ;;
+            "HTML")      EXPORT_FLAG="" ;;
+            "PDF")       EXPORT_FLAG="--pdf" ;;
+            "Markdown")  EXPORT_FLAG="--md" ;;
           esac
+          NO_EMAIL_ARGS="--no-email --out-dir export_out"
           if [ -n "$EXPORT_SUB_IDS" ]; then
-            python scripts/export_course.py --course-id "$EXPORT_COURSE_ID" --sub-ids "$EXPORT_SUB_IDS" $EXPORT_FLAG
+            python scripts/export_course.py --course-id "$EXPORT_COURSE_ID" --sub-ids "$EXPORT_SUB_IDS" $EXPORT_FLAG $NO_EMAIL_ARGS
           else
-            python scripts/export_course.py --course-id "$EXPORT_COURSE_ID" $EXPORT_FLAG
+            python scripts/export_course.py --course-id "$EXPORT_COURSE_ID" $EXPORT_FLAG $NO_EMAIL_ARGS
           fi
+
+      - name: Upload export artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: course-export
+          path: export_out/
+          if-no-files-found: warn

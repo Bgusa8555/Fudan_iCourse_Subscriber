@@ -197,6 +197,16 @@ def _safe_filename(title: str) -> str:
     return "".join(c if c.isalnum() or c in " _-" else "_" for c in title)
 
 
+def _write_files(files: list[tuple[bytes, str]], out_dir: str) -> None:
+    """Write ``(content_bytes, filename)`` pairs to *out_dir*."""
+    os.makedirs(out_dir, exist_ok=True)
+    for data, filename in files:
+        path = os.path.join(out_dir, filename)
+        with open(path, "wb") as f:
+            f.write(data)
+        print(f"[saved] {path} ({len(data)} bytes)")
+
+
 def _query_course(db: Database, course_id: str,
                   sub_ids: list[str] | None = None) -> tuple[str, str, list[dict]] | None:
     """Return ``(course_title, teacher, lectures)`` for *course_id*.
@@ -266,6 +276,15 @@ def main():
         "--db", default="data/icourse.db",
         help="Database path (default: data/icourse.db)",
     )
+    parser.add_argument(
+        "--no-email",
+        action="store_true",
+        help="Write output files to --out-dir instead of sending email",
+    )
+    parser.add_argument(
+        "--out-dir", default="export_out",
+        help="Directory to write output files when --no-email is set",
+    )
     args = parser.parse_args()
 
     if not os.path.isfile(args.db):
@@ -285,7 +304,9 @@ def main():
     if sub_ids:
         print(f"Filtering to {len(sub_ids)} sub_id(s): {', '.join(sub_ids)}")
 
-    if not config.SMTP_EMAIL or not config.SMTP_PASSWORD or not config.RECEIVER_EMAIL:
+    if not args.no_email and (
+        not config.SMTP_EMAIL or not config.SMTP_PASSWORD or not config.RECEIVER_EMAIL
+    ):
         print("Email configuration incomplete. Set SMTP_EMAIL, SMTP_PASSWORD, RECEIVER_EMAIL.")
         sys.exit(1)
 
@@ -317,6 +338,10 @@ def main():
             print("No courses with summaries found – nothing to send.")
             sys.exit(0)
 
+        if args.no_email:
+            _write_files(attachments, args.out_dir)
+            sys.exit(0)
+
         subject = "[iCourse 课程摘要导出] " + ", ".join(titles)
         total_bytes = sum(len(b) for b, _ in attachments)
         print(f"Sending email with {len(attachments)} PDF(s) ({total_bytes} bytes)...")
@@ -344,6 +369,10 @@ def main():
             print("No courses with summaries found – nothing to send.")
             sys.exit(0)
 
+        if args.no_email:
+            _write_files(attachments, args.out_dir)
+            sys.exit(0)
+
         subject = "[iCourse 课程摘要导出] " + ", ".join(titles)
         total_bytes = sum(len(b) for b, _ in attachments)
         print(f"Sending email with {len(attachments)} MD(s) ({total_bytes} bytes)...")
@@ -352,6 +381,7 @@ def main():
 
     else:
         # Email mode: one CID-embedded HTML email per course
+        html_files: list[tuple[bytes, str]] = []
         sent = 0
         for cid in course_ids:
             result = _query_course(db, cid, sub_ids=sub_ids)
@@ -365,12 +395,25 @@ def main():
             plain = _build_plain(course_title, teacher, lectures)
             subject = f"[iCourse 课程摘要导出] {course_title}"
 
+            if args.no_email:
+                filename = f"{_safe_filename(course_title)}_summaries.html"
+                html_files.append((html.encode("utf-8"), filename))
+                print(f"  HTML ready ({len(html)} chars): {filename}")
+                continue
+
             print(f"Sending HTML email for {course_title}...")
             if cid_images:
                 print(f"  Embedded {len(cid_images)} LaTeX image(s) as CID")
             _send_html_email(subject, html, plain, cid_images=cid_images)
             print(f"[OK] Sent: {subject}")
             sent += 1
+
+        if args.no_email:
+            if not html_files:
+                print("No courses with summaries found – nothing to write.")
+                sys.exit(0)
+            _write_files(html_files, args.out_dir)
+            sys.exit(0)
 
         if sent == 0:
             print("No courses with summaries found – nothing to send.")
