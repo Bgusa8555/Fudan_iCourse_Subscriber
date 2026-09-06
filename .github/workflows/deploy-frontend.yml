@@ -31,7 +31,7 @@ jobs:
       # On manual dispatch we honour the ``branch`` input; for the auto
       # push trigger this resolves to '' and actions/checkout falls back
       # to the triggering ref (i.e. main per the push filter above).
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.branch || github.ref }}
 
