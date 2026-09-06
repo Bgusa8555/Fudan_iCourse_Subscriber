@@ -25,6 +25,7 @@ import argparse
 import os
 import smtplib
 import sys
+import time
 from email import encoders
 from email.mime.base import MIMEBase
 from email.mime.image import MIMEImage
@@ -99,11 +100,26 @@ def _build_plain(course_title: str, teacher: str, lectures: list[dict]) -> str:
     return "\n".join(parts)
 
 
-def _smtp_connect():
-    """Return an authenticated SMTP_SSL connection."""
-    server = smtplib.SMTP_SSL(config.SMTP_HOST, config.SMTP_PORT)
-    server.login(config.SMTP_EMAIL, config.SMTP_PASSWORD)
-    return server
+def _smtp_send(msg) -> None:
+    """Send a built MIME message via QQ SMTP, retrying transient failures.
+
+    QQ SMTP intermittently drops the connection during login when the
+    client is on a foreign IP (e.g. GitHub-hosted runners).  Mirror the
+    retry/backoff used by src.api.emailer.Emailer.send() so a single
+    dropped connection does not fail the whole export.
+    """
+    for attempt in range(3):
+        try:
+            with smtplib.SMTP_SSL(config.SMTP_HOST, config.SMTP_PORT) as server:
+                server.login(config.SMTP_EMAIL, config.SMTP_PASSWORD)
+                server.sendmail(config.SMTP_EMAIL, config.RECEIVER_EMAIL,
+                                msg.as_string())
+            return
+        except Exception as e:
+            print(f"SMTP attempt {attempt + 1}/3 failed: {e}")
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+    raise RuntimeError("SMTP send failed after 3 attempts")
 
 
 def _send_html_email(subject: str, html: str, plain: str,
@@ -132,8 +148,7 @@ def _send_html_email(subject: str, html: str, plain: str,
                                 filename=f"{cid}.png")
             msg.attach(img_part)
 
-    with _smtp_connect() as server:
-        server.sendmail(config.SMTP_EMAIL, config.RECEIVER_EMAIL, msg.as_string())
+    _smtp_send(msg)
 
 
 def _send_pdf_email(subject: str,
@@ -155,8 +170,7 @@ def _send_pdf_email(subject: str,
         part.add_header("Content-Disposition", "attachment", filename=filename)
         msg.attach(part)
 
-    with _smtp_connect() as server:
-        server.sendmail(config.SMTP_EMAIL, config.RECEIVER_EMAIL, msg.as_string())
+    _smtp_send(msg)
 
 def _send_md_email(subject: str, md_content: list[tuple[bytes, str]]) -> None:
     """Send an email with Markdown content.
@@ -176,8 +190,7 @@ def _send_md_email(subject: str, md_content: list[tuple[bytes, str]]) -> None:
         part.add_header("Content-Disposition", "attachment", filename=filename)
         msg.attach(part)
 
-    with _smtp_connect() as server:
-        server.sendmail(config.SMTP_EMAIL, config.RECEIVER_EMAIL, msg.as_string())
+    _smtp_send(msg)
 
 def _safe_filename(title: str) -> str:
     """Sanitise a course title for use as a filename."""
