@@ -86,4 +86,13 @@ jobs:
           git add data/
           git commit -q -m "chore: reset empty-summary lectures for ${{ inputs.course_ids }}"
           git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
-          git push --force origin data
+          for attempt in 1 2 3 4 5; do
+            if git push --force origin data; then
+              echo "Push succeeded (attempt $attempt)."
+              exit 0
+            fi
+            echo "Push attempt $attempt failed; retrying in $((attempt * 5))s..."
+            sleep $((attempt * 5))
+          done
+          echo "::error::Force-push to data branch failed after 5 attempts."
+          exit 1
