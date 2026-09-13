@@ -28,6 +28,11 @@ from typing import Callable, Optional
 import numpy as np
 import sherpa_onnx
 
+import onnxruntime
+# Silence ONNX Runtime's harmless device-discovery warnings (e.g. the
+# "Skipping pci_bus_id" line it emits under WSL2).  3 = ERROR and above only.
+onnxruntime.set_default_logger_severity(3)
+
 from src.runtime import config
 
 
