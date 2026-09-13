@@ -387,6 +387,8 @@ class Transcriber:
         segments: list[dict] = []
         total_read = 0      # samples
         total_bytes = 0
+        peak = 0.0          # max |sample| (empty-transcript diagnostics)
+        sum_sq = 0.0        # sum of squares, for RMS
         last_report = t0
         last_segment_at = 0.0
         silence_marked = False
@@ -409,6 +411,9 @@ class Transcriber:
             total_bytes += len(raw)
             samples = np.frombuffer(raw, dtype=np.float32)
             total_read += len(samples)
+            if samples.size:
+                peak = max(peak, float(np.max(np.abs(samples))))
+                sum_sq += float(np.sum(samples.astype(np.float64) ** 2))
             audio_pos = total_read / SAMPLE_RATE
 
             # Progress report every 60 s
@@ -545,6 +550,21 @@ class Transcriber:
             f"in {elapsed:.0f}s",
             flush=True,
         )
+        if not segments:
+            rms = (sum_sq / total_read) ** 0.5 if total_read else 0.0
+            print(
+                f"[Transcriber] EMPTY-TRANSCRIPT DIAGNOSTIC: "
+                f"{total_read} samples, peak={peak:.4f}, rms={rms:.4f}",
+                flush=True,
+            )
+            layout = [
+                ln.strip() for ln in stderr_output.decode(errors="replace").splitlines()
+                if ln.strip().startswith(("Input #", "Stream #", "Duration:"))
+            ]
+            if layout:
+                print("[Transcriber] ffmpeg stream layout:", flush=True)
+                for ln in layout:
+                    print(f"    {ln}", flush=True)
         self._last_transcript = transcript
         self._last_segments = segments
         return transcript, segments

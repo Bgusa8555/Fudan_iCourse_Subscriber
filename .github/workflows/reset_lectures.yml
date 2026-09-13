@@ -1,0 +1,89 @@
+name: Reset Empty-Summary Lectures
+
+on:
+  workflow_dispatch:
+    inputs:
+      course_ids:
+        description: "Course ID(s) whose 'No Content' (empty-summary) lectures should be reset for re-processing, comma-separated"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: db-reset
+  cancel-in-progress: false
+
+jobs:
+  reset:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pycryptodome
+
+      - name: Fetch and decrypt database
+        env:
+          STUID: ${{ secrets.STUID }}
+          UISPSW: ${{ secrets.UISPSW }}
+        run: |
+          git fetch origin data --depth=1
+          mkdir -p data/sharded/shards
+          if git cat-file -e origin/data:data/icourse-index.enc 2>/dev/null; then
+            git show origin/data:data/icourse-index.enc > data/sharded/icourse-index.enc
+            shard_paths=$(git ls-tree -r --name-only origin/data | grep '^data/shards/' || true)
+            for path in $shard_paths; do
+              base=$(basename "$path")
+              git show "origin/data:$path" > "data/sharded/shards/$base"
+            done
+            python scripts/db_shard.py reassemble data/sharded data/icourse.db
+          else
+            echo "::error::No sharded database found on data branch."
+            exit 1
+          fi
+
+      - name: Reset empty-summary lectures
+        run: |
+          IFS=',' read -ra CIDS <<< "${{ inputs.course_ids }}"
+          for cid in "${CIDS[@]}"; do
+            cid=$(echo "$cid" | xargs)
+            before=$(sqlite3 data/icourse.db "SELECT COUNT(*) FROM lectures WHERE course_id='$cid' AND processed_at IS NOT NULL AND (summary IS NULL OR summary='')")
+            sqlite3 data/icourse.db "UPDATE lectures SET processed_at=NULL, summary=NULL, transcript=NULL, emailed_at=NULL, error_msg=NULL, error_stage=NULL, error_count=0 WHERE course_id='$cid' AND processed_at IS NOT NULL AND (summary IS NULL OR summary='')"
+            echo "Reset $before 'No Content' lecture(s) for course $cid"
+          done
+
+      - name: Re-shard and push
+        env:
+          STUID: ${{ secrets.STUID }}
+          UISPSW: ${{ secrets.UISPSW }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          rm -rf data/sharded_out
+          mkdir -p data/sharded_out
+          python scripts/db_shard.py shard data/icourse.db data/sharded_out
+
+          rm -rf /tmp/db_deploy
+          mkdir -p /tmp/db_deploy/data/shards
+          cp data/sharded_out/icourse-index.enc /tmp/db_deploy/data/
+          cp data/sharded_out/shards/*.db.gz.enc /tmp/db_deploy/data/shards/
+          cd /tmp/db_deploy
+
+          git init -q
+          git checkout -q -b data
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/
+          git commit -q -m "chore: reset empty-summary lectures for ${{ inputs.course_ids }}"
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
+          git push --force origin data
