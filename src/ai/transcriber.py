@@ -389,6 +389,9 @@ class Transcriber:
         total_bytes = 0
         peak = 0.0          # max |sample| (empty-transcript diagnostics)
         sum_sq = 0.0        # sum of squares, for RMS
+        max_chunk_rms = 0.0  # loudest ~1s window (empty-transcript diagnostics)
+        max_chunk_at = 0.0   # offset (s) of that window
+        audible_secs = 0.0   # seconds whose ~1s window rms > 0.01
         last_report = t0
         last_segment_at = 0.0
         silence_marked = False
@@ -413,7 +416,14 @@ class Transcriber:
             total_read += len(samples)
             if samples.size:
                 peak = max(peak, float(np.max(np.abs(samples))))
-                sum_sq += float(np.sum(samples.astype(np.float64) ** 2))
+                chunk_sum_sq = float(np.sum(samples.astype(np.float64) ** 2))
+                sum_sq += chunk_sum_sq
+                chunk_rms = (chunk_sum_sq / len(samples)) ** 0.5
+                if chunk_rms > max_chunk_rms:
+                    max_chunk_rms = chunk_rms
+                    max_chunk_at = total_read / SAMPLE_RATE
+                if chunk_rms > 0.01:
+                    audible_secs += len(samples) / SAMPLE_RATE
             audio_pos = total_read / SAMPLE_RATE
 
             # Progress report every 60 s
@@ -554,7 +564,9 @@ class Transcriber:
             rms = (sum_sq / total_read) ** 0.5 if total_read else 0.0
             print(
                 f"[Transcriber] EMPTY-TRANSCRIPT DIAGNOSTIC: "
-                f"{total_read} samples, peak={peak:.4f}, rms={rms:.4f}",
+                f"{total_read} samples, peak={peak:.4f}, rms={rms:.4f}, "
+                f"loudest_1s={max_chunk_rms:.4f}@{max_chunk_at:.0f}s, "
+                f"audible_secs={audible_secs:.1f}",
                 flush=True,
             )
             layout = [
