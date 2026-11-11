@@ -18,6 +18,7 @@ from Crypto.Cipher import PKCS1_v1_5
 import base64
 
 from src.runtime import config
+from src.api.verification import resolve_login_token
 
 
 def encrypt_host(hostname: str) -> str:
@@ -298,15 +299,16 @@ class WebVPNSession:
         )
         data = resp.json()
 
-        if str(data.get("code")) != "200":
-            raise RuntimeError(
-                f"iCourse CAS auth failed (code={data.get('code')})"
-            )
-
-        login_token = data.get("loginToken", "")
-        if not login_token:
-            raise RuntimeError("No loginToken in iCourse CAS response")
-        print("    loginToken: OK")
+        login_token = resolve_login_token(
+            self.session, data, payload,
+            route=get_vpn_url,
+            headers={
+                "Content-Type": "application/json",
+                "Referer": f"{idp_vpn_base}/ac/",
+                "Origin": config.WEBVPN_BASE,
+            },
+            label="iCourse CAS",
+        )
 
         # Step 6: Get CAS ticket (through WebVPN)
         print("[6/7] Getting CAS ticket (via WebVPN)...")
@@ -522,18 +524,16 @@ class WebVPNSession:
         )
         data = resp.json()
 
-        if str(data.get("code")) != "200":
-            raise RuntimeError(
-                f"Authentication failed (code={data.get('code')})"
-            )
-
-        # loginToken is at top level, not nested under "data"
-        login_token = data.get("loginToken", "")
-        if not login_token:
-            raise RuntimeError("No loginToken in response")
-
-        print("    loginToken: OK")
-        return login_token
+        return resolve_login_token(
+            self.session, data, payload,
+            route=lambda url: url,
+            headers={
+                "Content-Type": "application/json",
+                "Referer": f"{config.IDP_BASE}/ac/",
+                "Origin": config.IDP_BASE,
+            },
+            label="WebVPN",
+        )
 
     def _get_cas_ticket(self, login_token: str) -> str:
         """Step 6: Exchange loginToken for a CAS ticket URL."""

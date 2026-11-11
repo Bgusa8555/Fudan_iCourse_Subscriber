@@ -27,17 +27,15 @@ from src.runtime.scheduler import Scheduler
 from src.ai.summarizer import Summarizer
 from src.ai.transcriber import Transcriber
 from src.api.webvpn import WebVPNSession
+from src.api.verification import VerificationError
 
 
 def login_with_retry(max_attempts: int = 10) -> WebVPNSession:
     """Login to WebVPN + iCourse CAS, retrying on transient failures.
 
-    The iCourse CAS step (authenticate_icourse) has its own inner retry
-    loop for transient redirect-chain hiccups; this outer loop only runs
-    when those inner retries are exhausted, which generally means the
-    WebVPN session itself needs a fresh login.  5 attempts handles the
-    long tail of times when CAS rejects multiple fresh sessions in a
-    row before letting one through.
+    QR verification waits inside the existing session. An expired, rejected,
+    or unavailable interactive verification must not create ten new sessions
+    and ten sets of verification emails. Transient login failures still retry.
     """
     for attempt in range(max_attempts):
         try:
@@ -47,6 +45,8 @@ def login_with_retry(max_attempts: int = 10) -> WebVPNSession:
             print("[Login] iCourse CAS...")
             vpn.authenticate_icourse()
             return vpn
+        except VerificationError:
+            raise
         except Exception as e:
             if attempt < max_attempts - 1:
                 print(f"  Failed: {type(e).__name__}: {e}; retrying...")

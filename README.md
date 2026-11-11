@@ -78,6 +78,19 @@
 
 首次运行会处理所有已有录播，后续只处理新增课次。
 
+### 微信扫码二次验证
+
+如果学校在密码认证后要求微信扫码，程序会保留当前 WebVPN/CAS 会话，并通过已配置的 `SMTP_EMAIL`、`SMTP_PASSWORD` 和 `RECEIVER_EMAIL` 发送标题为 **「[FiCS] 请使用微信扫码完成登录验证」** 的邮件。用绑定学校账号的微信扫描邮件中的二维码并确认后，**同一次运行自动继续获取课程和处理任务**，无需再次触发 workflow。
+
+- 默认最多等待 **600 秒（10 分钟）**。手动运行 **iCourse Check** 或 **Single Run** 时可用 `verification_timeout` 调整；定时运行可在仓库 **Settings → Secrets and variables → Actions → Variables** 设置 `AUTH_VERIFICATION_TIMEOUT`。
+- 二维码被学校判定过期后会重新获取并发送，默认最多 3 个。请以最新邮件为准，可通过仓库变量 `AUTH_VERIFICATION_MAX_QR_CODES` 调整数量；所有二维码共用本次等待期限。
+- 在本机运行时，日志还会给出临时 HTML 扫码入口，默认位于 `data/auth-verification/`。未配置邮箱时可直接打开该页面扫码。验证结束或失败后，临时页面和图片会自动删除。
+- GitHub Actions 中必须成功投递验证邮件才会等待扫码。邮件配置缺失、验证被拒绝、超时或学校要求尚未支持的验证方式时，会明确报错，避免反复创建登录会话。只有收到学校实际返回的 `loginToken` 才会继续交换 CAS ticket。
+
+该流程同时覆盖 WebVPN 登录和经 WebVPN 进行的 iCourse CAS 登录。普通密码登录成功时不会发送验证邮件。不要另开学校登录页代替邮件二维码，否则会产生不同的认证会话。
+
+认证回归测试：`python -m unittest discover -s tests -p 'test_*.py' -v`（仅需 `requests` 和 `pycryptodome`，不需要下载 ASR 模型）。
+
 ## 前端页面（索引与查看）
 
 ![alt text](docs/frontend.png)
