@@ -167,8 +167,14 @@ jobs:
             echo "hash=none" >> $GITHUB_OUTPUT
           fi
 
+      - name: Prepare verification download support
+        timeout-minutes: 3
+        continue-on-error: true
+        run: npm ci --omit=dev --no-audit --no-fund --prefix .github/actions/run-with-verification
+
       - name: Run
         timeout-minutes: 350
+        uses: ./.github/actions/run-with-verification
         env:
           StuId: ${{ secrets.STUID }}
           UISPsw: ${{ secrets.UISPSW }}
@@ -184,11 +190,6 @@ jobs:
           # base_url_env), so user-defined providers with custom env-var
           # names work without editing this workflow.
           SECRETS_CONTEXT: ${{ toJSON(secrets) }}
-        run: |
-          eval "$(python scripts/provider_env.py)"
-          unset SECRETS_CONTEXT
-          python -u main.py
-
       - name: Deploy database to data branch
         if: always()
         env:

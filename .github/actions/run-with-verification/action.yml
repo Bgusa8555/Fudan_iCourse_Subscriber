@@ -1,0 +1,5 @@
+name: Run iCourse with a live verification entry
+description: Keep Python running while publishing temporary WeChat QR artifacts
+runs:
+  using: node24
+  main: index.cjs

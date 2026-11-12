@@ -1,6 +1,7 @@
 """Authentication regression tests; no credentials or live school requests."""
 
 import base64
+import json
 from contextlib import ExitStack, redirect_stdout
 from copy import deepcopy
 from io import StringIO
@@ -79,8 +80,11 @@ class VerificationTests(unittest.TestCase):
             SMTP_PASSWORD="smtp-secret",
             RECEIVER_EMAIL="receiver@example.com",
         ))
-        self.stack.enter_context(patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}))
+        self.stack.enter_context(patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "ICOURSE_VERIFICATION_BRIDGE": ""}))
         self.smtp = self.stack.enter_context(patch.object(verification.smtplib, "SMTP_SSL"))
+        self.smtp.return_value.send_message.return_value = {}
+        self.starttls = self.stack.enter_context(patch.object(verification.smtplib, "SMTP"))
+        self.starttls.return_value.send_message.return_value = {}
         self.output = self.stack.enter_context(redirect_stdout(StringIO()))
         self.pause = self.stack.enter_context(patch.object(verification.time, "sleep"))
         self.session = Mock(spec=requests.Session)
@@ -125,7 +129,7 @@ class VerificationTests(unittest.TestCase):
             self.assertNotIn("qr-secret", page)
             self.assertNotIn("sensitive-password", page)
 
-        self.smtp.return_value.__enter__.return_value.send_message.side_effect = confirm
+        self.smtp.return_value.send_message.side_effect = confirm
         self.assertEqual(self.resolve(), "real-token")
         self.assertTrue(page_seen)
         qr_call, auth_call = self.session.post.call_args_list
@@ -143,7 +147,7 @@ class VerificationTests(unittest.TestCase):
     def test_email_contains_actual_school_image_and_no_session_secrets(self):
         self.session.post.side_effect = [qr_response(), response({"code": 200, "loginToken": "ok"})]
         self.resolve()
-        server = self.smtp.return_value.__enter__.return_value
+        server = self.smtp.return_value
         message = server.send_message.call_args.args[0]
         self.assertEqual(message["To"], "receiver@example.com")
         images = [part for part in message.walk() if part.get_content_maintype() == "image"]
@@ -160,7 +164,7 @@ class VerificationTests(unittest.TestCase):
             response({"code": 200, "loginToken": "ok"}),
         ]
         self.assertEqual(self.resolve(), "ok")
-        self.assertEqual(self.smtp.return_value.__enter__.return_value.send_message.call_count, 1)
+        self.assertEqual(self.smtp.return_value.send_message.call_count, 1)
         payloads = [call.kwargs["json"] for call in self.session.post.call_args_list[1:]]
         self.assertTrue(all(payload == payloads[0] for payload in payloads))
         self.assert_clean()
@@ -192,7 +196,7 @@ class VerificationTests(unittest.TestCase):
         self.session.post.side_effect = post
         self.assertEqual(self.resolve(), "ok")
         self.assertEqual(tokens_used, ["qr-secret", "replacement-secret"])
-        self.assertEqual(self.smtp.return_value.__enter__.return_value.send_message.call_count, 2)
+        self.assertEqual(self.smtp.return_value.send_message.call_count, 2)
         self.assert_clean()
 
     def test_expired_qr_count_is_bounded(self):
@@ -245,11 +249,124 @@ class VerificationTests(unittest.TestCase):
 
     def test_smtp_failure_does_not_leave_unreachable_wait_in_ci(self):
         self.session.post.return_value = qr_response()
-        self.smtp.return_value.__enter__.side_effect = smtplib.SMTPException("private transport error")
+        self.smtp.side_effect = smtplib.SMTPException("private transport error")
+        self.starttls.side_effect = smtplib.SMTPException("private transport error")
         with self.assertRaises(VerificationError):
             self.resolve()
         self.assertEqual(self.session.post.call_count, 1)
         self.assertNotIn("private transport error", self.output.getvalue())
+        self.assert_clean()
+
+    def test_smtp_disconnect_uses_starttls_then_resumes_same_login(self):
+        self.session.post.side_effect = [qr_response(), response({"code": 200, "loginToken": "ok"})]
+        self.smtp.side_effect = smtplib.SMTPServerDisconnected("private server message")
+        self.assertEqual(self.resolve(), "ok")
+        self.assertEqual(self.smtp.call_count, 1)
+        self.starttls.assert_called_once()
+        self.assertEqual(self.starttls.call_args.args, (config.SMTP_HOST, 587))
+        server = self.starttls.return_value
+        calls = [call[0] for call in server.method_calls]
+        self.assertLess(calls.index("starttls"), calls.index("login"))
+        self.assertTrue(server.starttls.call_args.kwargs["context"].check_hostname)
+        self.assertEqual(server.ehlo.call_count, 2)
+        self.assertNotIn("private server message", self.output.getvalue())
+        self.assertEqual(self.session.post.call_count, 2)
+        self.assert_clean()
+
+    def test_smtp_disconnect_during_auth_is_retried(self):
+        self.session.post.side_effect = [qr_response(), response({"code": 200, "loginToken": "ok"})]
+        self.smtp.return_value.login.side_effect = smtplib.SMTPServerDisconnected("private auth message")
+        self.assertEqual(self.resolve(), "ok")
+        self.smtp.return_value.send_message.assert_not_called()
+        self.starttls.return_value.send_message.assert_called_once()
+        self.assertIn("认证失败", self.output.getvalue())
+        self.assert_clean()
+
+    def test_smtp_auth_rejection_stops_mail_retries(self):
+        self.session.post.return_value = qr_response()
+        self.smtp.return_value.login.side_effect = smtplib.SMTPAuthenticationError(535, b"smtp-secret")
+        with self.assertRaises(VerificationError):
+            self.resolve()
+        self.assertEqual(self.smtp.call_count, 1)
+        self.starttls.assert_not_called()
+        self.assertIn("SMTP 535", self.output.getvalue())
+        self.assert_clean()
+
+    def test_smtp_retries_are_bounded_when_both_ports_disconnect(self):
+        self.session.post.return_value = qr_response()
+        self.smtp.side_effect = smtplib.SMTPServerDisconnected()
+        self.starttls.side_effect = smtplib.SMTPServerDisconnected()
+        with self.assertRaises(VerificationError):
+            self.resolve()
+        self.assertEqual(self.smtp.call_count, 2)
+        self.assertEqual(self.starttls.call_count, 2)
+        self.assertEqual(self.session.post.call_count, 1)
+        self.assert_clean()
+
+    def test_starttls_failure_never_sends_cleartext_credentials(self):
+        self.session.post.return_value = qr_response()
+        self.smtp.side_effect = OSError()
+        self.starttls.return_value.starttls.side_effect = smtplib.SMTPNotSupportedError()
+        with self.assertRaises(VerificationError):
+            self.resolve()
+        self.starttls.return_value.login.assert_not_called()
+        self.starttls.return_value.send_message.assert_not_called()
+        self.assert_clean()
+
+    def test_custom_smtp_server_does_not_switch_to_qq_port(self):
+        self.session.post.side_effect = [qr_response(), response({"code": 200, "loginToken": "ok"})]
+        working_server = self.smtp.return_value
+        self.smtp.side_effect = [smtplib.SMTPServerDisconnected(), working_server]
+        with patch.object(config, "SMTP_HOST", "smtp.example.com"):
+            self.assertEqual(self.resolve(), "ok")
+        self.starttls.assert_not_called()
+        self.assert_clean()
+
+    def test_artifact_entry_keeps_ci_waiting_when_email_fails(self):
+        self.session.post.side_effect = [qr_response(), response({"code": 200, "loginToken": "ok"})]
+        url = "https://github.com/owner/repo/actions/runs/123/artifacts/456"
+        with patch.object(verification._WeChatVerification, "_publish_actions_entry", return_value=url), \
+             patch.object(verification._WeChatVerification, "_send_email", return_value=False):
+            self.assertEqual(self.resolve(), "ok")
+        self.assertIn(url, self.output.getvalue())
+        self.assertIn("当前任务继续等待扫码", self.output.getvalue())
+        self.assert_clean()
+
+    def test_real_bridge_requests_image_and_html_then_marks_cleanup(self):
+        self.session.post.side_effect = [qr_response(), response({"code": 200, "loginToken": "ok"})]
+        bridge = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
+        seen = []
+
+        def upload_on_poll(*args):
+            for request_path in bridge.glob("*.request.json"):
+                manifest = json.loads(request_path.read_text(encoding="utf-8"))
+                seen.append(manifest)
+                self.assertEqual(len(manifest["files"]), 2)
+                self.assertTrue(all(Path(name).exists() for name in manifest["files"]))
+                result = bridge / f"{manifest['id']}.result.json"
+                result.write_text(json.dumps({"url": "https://github.com/owner/repo/actions/runs/123/artifacts/456"}), encoding="utf-8")
+
+        with patch.dict(os.environ, {"ICOURSE_VERIFICATION_BRIDGE": str(bridge)}), \
+             patch.object(config, "SMTP_PASSWORD", ""), \
+             patch.object(verification.time, "sleep", side_effect=upload_on_poll):
+            self.assertEqual(self.resolve(), "ok")
+        self.assertEqual(len(seen), 1)
+        self.assertTrue((bridge / f"{seen[0]['id']}.remove").exists())
+        self.assert_clean()
+
+    def test_bridge_upload_failure_still_uses_email(self):
+        self.session.post.side_effect = [qr_response(), response({"code": 200, "loginToken": "ok"})]
+        bridge = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
+
+        def fail_upload(*args):
+            for request_path in bridge.glob("*.request.json"):
+                manifest = json.loads(request_path.read_text(encoding="utf-8"))
+                (bridge / f"{manifest['id']}.result.json").write_text("{}", encoding="utf-8")
+
+        with patch.dict(os.environ, {"ICOURSE_VERIFICATION_BRIDGE": str(bridge)}), \
+             patch.object(verification.time, "sleep", side_effect=fail_upload):
+            self.assertEqual(self.resolve(), "ok")
+        self.smtp.return_value.send_message.assert_called_once()
         self.assert_clean()
 
     def test_local_without_mail_can_use_page(self):

@@ -85,11 +85,15 @@
 - 默认最多等待 **600 秒（10 分钟）**。手动运行 **iCourse Check** 或 **Single Run** 时可用 `verification_timeout` 调整；定时运行可在仓库 **Settings → Secrets and variables → Actions → Variables** 设置 `AUTH_VERIFICATION_TIMEOUT`。
 - 二维码被学校判定过期后会重新获取并发送，默认最多 3 个。请以最新邮件为准，可通过仓库变量 `AUTH_VERIFICATION_MAX_QR_CODES` 调整数量；所有二维码共用本次等待期限。
 - 在本机运行时，日志还会给出临时 HTML 扫码入口，默认位于 `data/auth-verification/`。未配置邮箱时可直接打开该页面扫码。验证结束或失败后，临时页面和图片会自动删除。
-- GitHub Actions 中必须成功投递验证邮件才会等待扫码。邮件配置缺失、验证被拒绝、超时或学校要求尚未支持的验证方式时，会明确报错，避免反复创建登录会话。只有收到学校实际返回的 `loginToken` 才会继续交换 CAS ticket。
+- GitHub Actions 在云端运行，无法在你的电脑自动弹出浏览器。需要验证时，**Run 日志会显示「二维码下载入口」链接**；点击下载 ZIP，解压并打开其中的 HTML 页面，即可用微信扫码。这个附件在任务等待时就可下载，无需等任务结束。不要打开日志中的 `/home/runner/...` 路径，那是云端文件。
+- 二维码邮件遇到断线会在同一认证会话中重试，QQ 邮箱还会尝试 587 端口的 STARTTLS 加密连接。若日志明确显示邮箱认证被拒绝，请检查 QQ 邮箱 SMTP 授权码。邮件失败时仍可使用日志中的下载入口继续扫码。
+- 临时附件在验证结束或二维码刷新后尝试删除，最长保留 1 天；请在当前任务的等待期限内打开最新入口。邮件和附件都不可用时才会报告无法提供扫码入口；验证拒绝、超时或学校要求其他验证方式时也会明确报错。只有收到学校实际返回的 `loginToken` 才会继续交换 CAS ticket。
 
 该流程同时覆盖 WebVPN 登录和经 WebVPN 进行的 iCourse CAS 登录。普通密码登录成功时不会发送验证邮件。不要另开学校登录页代替邮件二维码，否则会产生不同的认证会话。
 
 认证回归测试：`python -m unittest discover -s tests -p 'test_*.py' -v`（仅需 `requests` 和 `pycryptodome`，不需要下载 ASR 模型）。
+
+二维码入口测试：`node --test tests/test_verification_runner.cjs`。工作流会自动安装锁定版本的 GitHub 官方附件工具；如果安装失败，邮件入口仍可使用。
 
 ## 前端页面（索引与查看）
 

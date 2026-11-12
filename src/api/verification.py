@@ -8,15 +8,18 @@ The requests session, lck, and requestNumber must survive the entire exchange.
 import base64
 import binascii
 import html
+import json
 import os
 from pathlib import Path
 import re
 import smtplib
+import ssl
 import time
 import uuid
 from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.utils import formatdate, make_msgid
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -181,6 +184,7 @@ class _WeChatVerification:
                         f"{self.label}: 微信扫码被拒绝或验证失败 (code={result.get('code')})"
                     )
             finally:
+                self._remove_actions_entry(paths)
                 for path in paths:
                     path.unlink(missing_ok=True)
             self._remaining()
@@ -248,16 +252,70 @@ class _WeChatVerification:
         except OSError:
             pass  # Windows permissions are inherited from the local directory.
         print(f"[Verify] 本机扫码入口：{page_path}", flush=True)
+        artifact_url = self._publish_actions_entry(image_path, page_path)
+        if artifact_url:
+            print(
+                f"[Verify] 二维码下载入口：{artifact_url}\n"
+                "[Verify] 点击链接下载并解压，打开 HTML 页面，用微信扫码确认。",
+                flush=True,
+            )
         sent = self._send_email(image_bytes, subtype)
         if sent:
             print("[Verify] 二维码已发送到 RECEIVER_EMAIL，请查看最新的验证邮件。", flush=True)
+        elif artifact_url:
+            print("[Verify] 邮件发送失败，请使用上面的二维码下载入口；当前任务继续等待扫码。", flush=True)
         elif os.environ.get("GITHUB_ACTIONS", "").lower() == "true":
             raise VerificationError(
-                "无法发送微信扫码入口。请检查 SMTP_EMAIL、SMTP_PASSWORD、"
-                "RECEIVER_EMAIL 后重新运行；GitHub Actions 需要邮件投递成功才能等待扫码。"
+                "二维码邮件及 Actions 下载入口均不可用。请检查 SMTP_EMAIL、SMTP_PASSWORD、"
+                "RECEIVER_EMAIL，并从最新 main 分支运行 workflow。"
             )
         else:
             print("[Verify] 未发送邮件，请在本机打开上面的 HTML 页面扫码。", flush=True)
+
+    def _publish_actions_entry(self, image_path, page_path):
+        """Ask the JavaScript action to finalize a downloadable artifact now.
+
+        Artifacts uploaded by the v4 backend can be downloaded while the job
+        is still running. A later workflow step would run only after login,
+        making it too late for the phone confirmation.
+        """
+        bridge = os.environ.get("ICOURSE_VERIFICATION_BRIDGE")
+        if not bridge:
+            return None
+        directory = Path(bridge)
+        directory.mkdir(parents=True, exist_ok=True)
+        request = directory / f"{page_path.stem}.request.json"
+        temporary = request.with_suffix(".tmp")
+        temporary.write_text(json.dumps({
+            "id": page_path.stem,
+            "directory": str(page_path.parent),
+            "files": [str(image_path), str(page_path)],
+        }), encoding="utf-8")
+        temporary.replace(request)
+        result = directory / f"{page_path.stem}.result.json"
+        expires = time.monotonic() + min(90, self._remaining())
+        while not result.exists():
+            if time.monotonic() >= expires:
+                print("[Verify] Actions 二维码入口准备超时，尝试邮件发送。", flush=True)
+                return None
+            time.sleep(min(1, self._remaining()))
+        try:
+            data = json.loads(result.read_text(encoding="utf-8"))
+            url = data.get("url", "")
+            if re.fullmatch(r"https://github\.com/[\w.-]+/[\w.-]+/actions/runs/\d+/artifacts/\d+", url):
+                return url
+        except (OSError, ValueError):
+            pass
+        print("[Verify] Actions 二维码入口暂不可用，尝试邮件发送。", flush=True)
+        return None
+
+    def _remove_actions_entry(self, paths):
+        bridge = os.environ.get("ICOURSE_VERIFICATION_BRIDGE")
+        if bridge and paths:
+            try:
+                (Path(bridge) / f"{paths[0].stem}.remove").touch()
+            except OSError:
+                pass  # The JavaScript action also cleans up on process exit.
 
     def _send_email(self, image_bytes, subtype):
         if not all((config.SMTP_EMAIL, config.SMTP_PASSWORD, config.RECEIVER_EMAIL)):
@@ -266,6 +324,8 @@ class _WeChatVerification:
         message["Subject"] = "[FiCS] 请使用微信扫码完成登录验证"
         message["From"] = config.SMTP_EMAIL
         message["To"] = config.RECEIVER_EMAIL
+        message["Date"] = formatdate(localtime=False, usegmt=True)
+        message["Message-ID"] = make_msgid(domain="icourse.local")
         alternative = MIMEMultipart("alternative")
         alternative.attach(MIMEText(
             "学校要求微信扫码验证。请查看邮件内的二维码或附件，"
@@ -285,13 +345,66 @@ class _WeChatVerification:
         image.add_header("Content-ID", "<wechat-qr>")
         image.add_header("Content-Disposition", "inline", filename=f"wechat-qr.{subtype}")
         message.attach(image)
-        try:
-            with smtplib.SMTP_SSL(
-                config.SMTP_HOST, config.SMTP_PORT, timeout=min(15, self._remaining())
-            ) as server:
+        # The QQ 465 connection can be dropped by the server before or during
+        # authentication. Retry the same image and transaction, alternating
+        # with QQ's TLS submission port. Never send credentials in plaintext.
+        transports = [(config.SMTP_PORT, "SSL")]
+        if config.SMTP_HOST.lower() == "smtp.qq.com" and config.SMTP_PORT == 465:
+            transports.append((587, "STARTTLS"))
+        tls_context = ssl.create_default_context()
+        for attempt in range(4):
+            port, transport = transports[attempt % len(transports)]
+            stage = "连接"
+            server = None
+            try:
+                options = {"timeout": min(15, self._remaining())}
+                if transport == "SSL":
+                    server = smtplib.SMTP_SSL(config.SMTP_HOST, port, context=tls_context, **options)
+                else:
+                    server = smtplib.SMTP(config.SMTP_HOST, port, **options)
+                    stage = "STARTTLS"
+                    self._set_smtp_timeout(server)
+                    server.ehlo()
+                    self._set_smtp_timeout(server)
+                    server.starttls(context=tls_context)
+                    self._set_smtp_timeout(server)
+                    server.ehlo()
+                stage = "认证"
+                self._set_smtp_timeout(server)
                 server.login(config.SMTP_EMAIL, config.SMTP_PASSWORD)
-                server.send_message(message)
-            return True
-        except (OSError, smtplib.SMTPException) as exc:
-            print(f"[Verify] 验证邮件发送失败 ({type(exc).__name__})。", flush=True)
-            return False
+                stage = "投递"
+                self._set_smtp_timeout(server)
+                refused = server.send_message(message)
+                if refused:
+                    raise smtplib.SMTPRecipientsRefused(refused)
+                return True
+            except (OSError, smtplib.SMTPException) as exc:
+                code = getattr(exc, "smtp_code", None)
+                print(
+                    f"[Verify] 验证邮件第 {attempt + 1}/4 次：{transport}/{port} "
+                    f"{stage}失败 ({type(exc).__name__}"
+                    + (f", SMTP {code}" if isinstance(code, int) else "") + ")。",
+                    flush=True,
+                )
+                # Retrying an explicitly rejected account/recipient cannot
+                # repair its settings; a dropped transport is different.
+                if isinstance(exc, smtplib.SMTPRecipientsRefused) or (
+                    isinstance(exc, smtplib.SMTPResponseException) and exc.smtp_code >= 500
+                ):
+                    print("[Verify] 邮箱服务器拒绝认证或投递，请检查授权码和收件人设置。", flush=True)
+                    return False
+            finally:
+                if server is not None:
+                    try:
+                        server.close()
+                    except (OSError, smtplib.SMTPException):
+                        pass
+            if attempt < 3:
+                time.sleep(min(2 ** (attempt + 1), self._remaining()))
+        return False
+
+    def _set_smtp_timeout(self, server):
+        timeout = min(15, self._remaining())
+        server.timeout = timeout
+        if server.sock is not None:
+            server.sock.settimeout(timeout)
