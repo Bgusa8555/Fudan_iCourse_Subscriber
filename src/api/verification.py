@@ -14,8 +14,10 @@ from pathlib import Path
 import re
 import smtplib
 import ssl
+import threading
 import time
 import uuid
+import webbrowser
 from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -73,6 +75,7 @@ class _WeChatVerification:
         self.headers = headers
         self.label = label
         self.deadline = None
+        self._email_started = False
 
     def _remaining(self):
         remaining = self.deadline - time.monotonic()
@@ -241,7 +244,7 @@ class _WeChatVerification:
             '<p>请用绑定学校账号的微信扫码并确认，完成后任务会自动继续。</p>'
             f'<img alt="微信验证二维码" style="width:280px;max-width:100%;image-rendering:pixelated" '
             f'src="data:image/{subtype};base64,{image_data}">'
-            f'<p>本次剩余等待时间约 {int(self._remaining())} 秒；请以最新邮件中的二维码为准。</p>'
+            f'<p>本次剩余等待时间约 {int(self._remaining())} 秒；请扫描最新打开的二维码。</p>'
             '</body></html>',
             encoding="utf-8",
         )
@@ -256,14 +259,28 @@ class _WeChatVerification:
         if artifact_url:
             print(
                 f"[Verify] 二维码下载入口：{artifact_url}\n"
-                "[Verify] 点击链接下载并解压，打开 HTML 页面，用微信扫码确认。",
+                "[Verify] 本机扫码助手会自动显示并刷新二维码；未启动助手时可使用下载入口。",
                 flush=True,
             )
+            # A QR can expire within 30 seconds. SMTP retries must not block
+            # its confirmation request, or consume most of that lifetime.
+            if not self._email_started:
+                self._email_started = True
+                threading.Thread(
+                    target=self._send_email_in_background,
+                    args=(image_bytes, subtype), daemon=True,
+                ).start()
+            return
+        if os.environ.get("GITHUB_ACTIONS", "").lower() != "true":
+            try:
+                if webbrowser.open(page_path.as_uri(), new=2):
+                    print("[Verify] 已在本机浏览器打开微信扫码页面。", flush=True)
+                    return
+            except (OSError, webbrowser.Error):
+                pass
         sent = self._send_email(image_bytes, subtype)
         if sent:
             print("[Verify] 二维码已发送到 RECEIVER_EMAIL，请查看最新的验证邮件。", flush=True)
-        elif artifact_url:
-            print("[Verify] 邮件发送失败，请使用上面的二维码下载入口；当前任务继续等待扫码。", flush=True)
         elif os.environ.get("GITHUB_ACTIONS", "").lower() == "true":
             raise VerificationError(
                 "二维码邮件及 Actions 下载入口均不可用。请检查 SMTP_EMAIL、SMTP_PASSWORD、"
@@ -271,6 +288,15 @@ class _WeChatVerification:
             )
         else:
             print("[Verify] 未发送邮件，请在本机打开上面的 HTML 页面扫码。", flush=True)
+
+    def _send_email_in_background(self, image_bytes, subtype):
+        try:
+            if self._send_email(image_bytes, subtype):
+                print("[Verify] 首张二维码已发送到 RECEIVER_EMAIL，请以当前扫码页面为准。", flush=True)
+            else:
+                print("[Verify] 邮件未送达；请使用本机扫码助手或二维码下载入口，当前任务继续等待。", flush=True)
+        except VerificationError:
+            pass  # The main authentication deadline has already elapsed.
 
     def _publish_actions_entry(self, image_path, page_path):
         """Ask the JavaScript action to finalize a downloadable artifact now.

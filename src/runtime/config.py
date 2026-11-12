@@ -122,9 +122,9 @@ SMTP_PORT = 465
 # Database & Storage
 DATA_DIR = os.environ.get("DATA_DIR", "data")
 # Keep the current authentication transaction alive while the user confirms
-# the school's WeChat QR code. SMTP settings above deliver the entry in CI.
+# the school's WeChat QR code. The local assistant displays CI QR artifacts.
 AUTH_VERIFICATION_TIMEOUT = int(os.environ.get("AUTH_VERIFICATION_TIMEOUT", "600"))
-AUTH_VERIFICATION_MAX_QR_CODES = int(os.environ.get("AUTH_VERIFICATION_MAX_QR_CODES", "3"))
+AUTH_VERIFICATION_MAX_QR_CODES = int(os.environ.get("AUTH_VERIFICATION_MAX_QR_CODES", "30"))
 AUTH_VERIFICATION_DIR = os.environ.get(
     "AUTH_VERIFICATION_DIR", os.path.join(DATA_DIR, "auth-verification")
 )

@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import smtplib
 import tempfile
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
@@ -85,6 +86,8 @@ class VerificationTests(unittest.TestCase):
         self.smtp.return_value.send_message.return_value = {}
         self.starttls = self.stack.enter_context(patch.object(verification.smtplib, "SMTP"))
         self.starttls.return_value.send_message.return_value = {}
+        self.background = self.stack.enter_context(patch.object(verification._WeChatVerification, "_send_email_in_background"))
+        self.stack.enter_context(patch.object(verification.webbrowser, "open", return_value=False))
         self.output = self.stack.enter_context(redirect_stdout(StringIO()))
         self.pause = self.stack.enter_context(patch.object(verification.time, "sleep"))
         self.session = Mock(spec=requests.Session)
@@ -329,7 +332,43 @@ class VerificationTests(unittest.TestCase):
              patch.object(verification._WeChatVerification, "_send_email", return_value=False):
             self.assertEqual(self.resolve(), "ok")
         self.assertIn(url, self.output.getvalue())
-        self.assertIn("当前任务继续等待扫码", self.output.getvalue())
+        self.assertIn("二维码下载入口", self.output.getvalue())
+        self.assert_clean()
+
+    def test_confirmation_starts_while_background_email_is_still_blocked(self):
+        started = threading.Event()
+        release = threading.Event()
+        done = threading.Event()
+
+        def blocked_mail(*args):
+            started.set()
+            release.wait(5)
+            done.set()
+
+        def post(url, **kwargs):
+            if url.endswith("getAuthQr"):
+                return qr_response()
+            self.assertTrue(started.wait(1))
+            self.assertFalse(release.is_set())
+            return response({"code": 200, "loginToken": "ok"})
+
+        self.background.side_effect = blocked_mail
+        self.session.post.side_effect = post
+        try:
+            with patch.object(verification._WeChatVerification, "_publish_actions_entry", return_value="https://github.com/owner/repo/actions/runs/1/artifacts/2"):
+                self.assertEqual(self.resolve(), "ok")
+        finally:
+            release.set()
+            self.assertTrue(done.wait(1))
+        self.assert_clean()
+
+    def test_local_browser_is_opened_automatically_before_mail_delivery(self):
+        self.session.post.side_effect = [qr_response(), response({"code": 200, "loginToken": "ok"})]
+        with patch.dict(os.environ, {"GITHUB_ACTIONS": ""}), \
+             patch.object(verification.webbrowser, "open", return_value=True) as browser:
+            self.assertEqual(self.resolve(), "ok")
+        self.assertTrue(browser.call_args.args[0].startswith("file:"))
+        self.smtp.assert_not_called()
         self.assert_clean()
 
     def test_real_bridge_requests_image_and_html_then_marks_cleanup(self):
